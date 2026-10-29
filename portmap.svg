@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="279.4mm" height="215.9mm"
+     viewBox="0 0 1100 850" font-family="DejaVu Sans, Verdana, sans-serif">
+  <style>
+    @page { size: 11in 8.5in; margin: 0; }
+    svg { width: 11in; height: 8.5in; }
+  </style>
+
+  <rect x="0" y="0" width="1100" height="850" fill="#ffffff"/>
+
+  <text x="40" y="38" font-size="25" font-weight="bold" fill="#111">VeloCloud Edge 520B — rear panel, as you face the back of the box</text>
+  <text x="40" y="64" font-size="14" fill="#444">Jack map. 2 rows x 6 sockets = 12. Columns numbered left to right.</text>
+
+  <!-- I/O shield outline -->
+  <rect x="32" y="92" width="1036" height="412" rx="10" fill="none" stroke="#bbb" stroke-width="1.5"/>
+
+  <!-- column numbers -->
+  <text x="120" y="88" font-size="14" fill="#555" text-anchor="middle">col 1</text>
+  <text x="292" y="88" font-size="14" fill="#555" text-anchor="middle">col 2</text>
+  <text x="464" y="88" font-size="14" fill="#555" text-anchor="middle">col 3</text>
+  <text x="636" y="88" font-size="14" fill="#555" text-anchor="middle">col 4</text>
+  <text x="808" y="88" font-size="14" fill="#555" text-anchor="middle">col 5</text>
+  <text x="980" y="88" font-size="14" fill="#555" text-anchor="middle">col 6</text>
+
+  <!-- row labels -->
+  <text x="20" y="197" font-size="15" font-weight="bold" fill="#111" transform="rotate(-90 20 197)" text-anchor="middle">TOP ROW</text>
+  <text x="20" y="402" font-size="15" font-weight="bold" fill="#111" transform="rotate(-90 20 402)" text-anchor="middle">BOTTOM ROW</text>
+
+  <!-- ================= TOP ROW ================= -->
+  <g>
+    <rect x="40" y="102" width="160" height="190" rx="7" fill="#f2f2f2" stroke="#888" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="120" y="128" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">SFP cage</text>
+    <text x="120" y="158" font-size="20" font-weight="bold" fill="#333" text-anchor="middle">igb0</text>
+    <text x="120" y="184" font-size="13" fill="#555" text-anchor="middle">PCI 4:0.0</text>
+    <text x="120" y="206" font-size="13" fill="#555" text-anchor="middle">Intel I350 SFP</text>
+    <text x="120" y="232" font-size="13" fill="#888" text-anchor="middle">stock igb driver</text>
+    <text x="120" y="254" font-size="13" fill="#888" text-anchor="middle">not touched by us</text>
+  </g>
+  <g>
+    <rect x="212" y="102" width="160" height="190" rx="7" fill="#dff0dc" stroke="#2f7d32" stroke-width="2.5"/>
+    <text x="292" y="128" font-size="14" font-weight="bold" fill="#2f7d32" text-anchor="middle">RJ45 — WAN0</text>
+    <text x="292" y="158" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb4</text>
+    <text x="292" y="184" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.2</text>
+    <text x="292" y="206" font-size="13" fill="#444" text-anchor="middle">88E1514 PHY</text>
+    <text x="292" y="232" font-size="13" font-weight="bold" fill="#2f7d32" text-anchor="middle">WAN — DHCP client</text>
+    <text x="292" y="254" font-size="13" fill="#2f7d32" text-anchor="middle">cable this one first</text>
+  </g>
+  <g>
+    <rect x="384" y="102" width="160" height="190" rx="7" fill="#dde9f5" stroke="#2a5d8f" stroke-width="2"/>
+    <text x="464" y="128" font-size="14" font-weight="bold" fill="#2a5d8f" text-anchor="middle">RJ45 — LAN1</text>
+    <text x="464" y="158" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb3</text>
+    <text x="464" y="184" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.1</text>
+    <text x="464" y="206" font-size="13" fill="#444" text-anchor="middle">etherswitch1 port1</text>
+    <text x="464" y="232" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="464" y="254" font-size="13" fill="#2a5d8f" text-anchor="middle">LAN bridge</text>
+  </g>
+  <g>
+    <rect x="556" y="102" width="160" height="190" rx="7" fill="#dde9f5" stroke="#2a5d8f" stroke-width="2"/>
+    <text x="636" y="128" font-size="14" font-weight="bold" fill="#2a5d8f" text-anchor="middle">RJ45 — LAN3</text>
+    <text x="636" y="158" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb3</text>
+    <text x="636" y="184" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.1</text>
+    <text x="636" y="206" font-size="13" fill="#444" text-anchor="middle">etherswitch1 port3</text>
+    <text x="636" y="232" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="636" y="254" font-size="13" fill="#2a5d8f" text-anchor="middle">LAN bridge</text>
+  </g>
+  <g>
+    <rect x="728" y="102" width="160" height="190" rx="7" fill="#eeeeee" stroke="#777" stroke-width="1.5"/>
+    <text x="808" y="128" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">RJ45 — LAN5</text>
+    <text x="808" y="158" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb2</text>
+    <text x="808" y="184" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.0</text>
+    <text x="808" y="206" font-size="13" fill="#444" text-anchor="middle">etherswitch0 port2</text>
+    <text x="808" y="232" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="808" y="254" font-size="13" fill="#777" text-anchor="middle">assign in GUI</text>
+  </g>
+  <g>
+    <rect x="900" y="102" width="160" height="190" rx="7" fill="#eeeeee" stroke="#777" stroke-width="1.5"/>
+    <text x="980" y="128" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">RJ45 — LAN7</text>
+    <text x="980" y="158" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb2</text>
+    <text x="980" y="184" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.0</text>
+    <text x="980" y="206" font-size="13" fill="#444" text-anchor="middle">etherswitch0 port1</text>
+    <text x="980" y="232" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="980" y="254" font-size="13" fill="#777" text-anchor="middle">assign in GUI</text>
+  </g>
+
+  <!-- ================= BOTTOM ROW ================= -->
+  <g>
+    <rect x="40" y="307" width="160" height="190" rx="7" fill="#f2f2f2" stroke="#888" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="120" y="333" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">SFP cage</text>
+    <text x="120" y="363" font-size="20" font-weight="bold" fill="#333" text-anchor="middle">igb1</text>
+    <text x="120" y="389" font-size="13" fill="#555" text-anchor="middle">PCI 4:0.1</text>
+    <text x="120" y="411" font-size="13" fill="#555" text-anchor="middle">Intel I350 SFP</text>
+    <text x="120" y="437" font-size="13" fill="#888" text-anchor="middle">stock igb driver</text>
+    <text x="120" y="459" font-size="13" fill="#888" text-anchor="middle">not touched by us</text>
+  </g>
+  <g>
+    <rect x="212" y="307" width="160" height="190" rx="7" fill="#f0f0f0" stroke="#777" stroke-width="1.5"/>
+    <text x="292" y="333" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">RJ45 — WAN1</text>
+    <text x="292" y="363" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb5</text>
+    <text x="292" y="389" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.3</text>
+    <text x="292" y="411" font-size="13" fill="#444" text-anchor="middle">88E1514 PHY</text>
+    <text x="292" y="437" font-size="13" fill="#777" text-anchor="middle">second WAN, optional</text>
+    <text x="292" y="459" font-size="13" fill="#777" text-anchor="middle">same bit-banged bus</text>
+  </g>
+  <g>
+    <rect x="384" y="307" width="160" height="190" rx="7" fill="#dde9f5" stroke="#2a5d8f" stroke-width="2"/>
+    <text x="464" y="333" font-size="14" font-weight="bold" fill="#2a5d8f" text-anchor="middle">RJ45 — LAN2</text>
+    <text x="464" y="363" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb3</text>
+    <text x="464" y="389" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.1</text>
+    <text x="464" y="411" font-size="13" fill="#444" text-anchor="middle">etherswitch1 port0</text>
+    <text x="464" y="437" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="464" y="459" font-size="13" fill="#2a5d8f" text-anchor="middle">LAN bridge</text>
+  </g>
+  <g>
+    <rect x="556" y="307" width="160" height="190" rx="7" fill="#dde9f5" stroke="#2a5d8f" stroke-width="2"/>
+    <text x="636" y="333" font-size="14" font-weight="bold" fill="#2a5d8f" text-anchor="middle">RJ45 — LAN4</text>
+    <text x="636" y="363" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb3</text>
+    <text x="636" y="389" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.1</text>
+    <text x="636" y="411" font-size="13" fill="#444" text-anchor="middle">etherswitch1 port2</text>
+    <text x="636" y="437" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="636" y="459" font-size="13" fill="#2a5d8f" text-anchor="middle">LAN bridge</text>
+  </g>
+  <g>
+    <rect x="728" y="307" width="160" height="190" rx="7" fill="#eeeeee" stroke="#777" stroke-width="1.5"/>
+    <text x="808" y="333" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">RJ45 — LAN6</text>
+    <text x="808" y="363" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb2</text>
+    <text x="808" y="389" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.0</text>
+    <text x="808" y="411" font-size="13" fill="#444" text-anchor="middle">etherswitch0 port0</text>
+    <text x="808" y="437" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="808" y="459" font-size="13" fill="#777" text-anchor="middle">assign in GUI</text>
+  </g>
+  <g>
+    <rect x="900" y="307" width="160" height="190" rx="7" fill="#eeeeee" stroke="#777" stroke-width="1.5"/>
+    <text x="980" y="333" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">RJ45 — LAN8</text>
+    <text x="980" y="363" font-size="20" font-weight="bold" fill="#111" text-anchor="middle">igb2</text>
+    <text x="980" y="389" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.0</text>
+    <text x="980" y="411" font-size="13" fill="#444" text-anchor="middle">etherswitch0 port3</text>
+    <text x="980" y="437" font-size="13" fill="#444" text-anchor="middle">linked 0x796d</text>
+    <text x="980" y="459" font-size="13" fill="#777" text-anchor="middle">assign in GUI</text>
+  </g>
+
+  <!-- ================= silicon band, aligned under the columns ================= -->
+  <g>
+    <rect x="40" y="520" width="160" height="112" rx="7" fill="#fafafa" stroke="#aaa"/>
+    <text x="120" y="546" font-size="14" font-weight="bold" fill="#333" text-anchor="middle">Intel I350 SFP pair</text>
+    <text x="120" y="572" font-size="13" fill="#444" text-anchor="middle">PCI 4:0.0 / 4:0.1</text>
+    <text x="120" y="594" font-size="13" fill="#444" text-anchor="middle">8086:1522, 1 GbE</text>
+    <text x="120" y="616" font-size="13" fill="#444" text-anchor="middle">igb0 / igb1</text>
+  </g>
+  <g>
+    <rect x="212" y="520" width="160" height="112" rx="7" fill="#eaf5e8" stroke="#2f7d32"/>
+    <text x="292" y="546" font-size="14" font-weight="bold" fill="#2f7d32" text-anchor="middle">2 x 88E1514 PHY</text>
+    <text x="292" y="572" font-size="13" fill="#444" text-anchor="middle">on I354 serdes</text>
+    <text x="292" y="594" font-size="13" fill="#444" text-anchor="middle">PCI 0:20.2 / 0:20.3</text>
+    <text x="292" y="616" font-size="13" fill="#444" text-anchor="middle">igb4 / igb5</text>
+  </g>
+  <g>
+    <rect x="384" y="520" width="332" height="112" rx="7" fill="#e6eef8" stroke="#2a5d8f"/>
+    <text x="550" y="546" font-size="14" font-weight="bold" fill="#2a5d8f" text-anchor="middle">etherswitch1 — Marvell 88E6176</text>
+    <text x="550" y="572" font-size="13" fill="#444" text-anchor="middle">CPU leg = port4 SGMII to igb3, PCI 0:20.1</text>
+    <text x="550" y="594" font-size="13" fill="#2a5d8f" text-anchor="middle">LAN1-4 — bridge member</text>
+    <text x="550" y="616" font-size="13" fill="#444" text-anchor="middle">e6000sw on igb3 internal MDIO</text>
+  </g>
+  <g>
+    <rect x="728" y="520" width="332" height="112" rx="7" fill="#f2f2f2" stroke="#777"/>
+    <text x="894" y="546" font-size="14" font-weight="bold" fill="#555" text-anchor="middle">etherswitch0 — Marvell 88E6176</text>
+    <text x="894" y="572" font-size="13" fill="#444" text-anchor="middle">CPU leg = port4 SGMII to igb2, PCI 0:20.0</text>
+    <text x="894" y="594" font-size="13" fill="#777" text-anchor="middle">LAN5-8 — assign them in the GUI</text>
+    <text x="894" y="616" font-size="13" fill="#444" text-anchor="middle">e6000sw on igb2 internal MDIO</text>
+  </g>
+
+  <!-- ================= legend ================= -->
+  <g>
+    <rect x="40" y="655" width="26" height="18" fill="#dff0dc" stroke="#2f7d32" stroke-width="2"/>
+    <text x="74" y="669" font-size="13" fill="#222">WAN (88E1514 PHY, bit-banged MDIO)</text>
+    <rect x="262" y="655" width="26" height="18" fill="#dde9f5" stroke="#2a5d8f" stroke-width="2"/>
+    <text x="296" y="669" font-size="13" fill="#222">LAN bridge (igb3)</text>
+    <rect x="466" y="655" width="26" height="18" fill="#eeeeee" stroke="#777"/>
+    <text x="500" y="669" font-size="13" fill="#222">LAN on igb2, assign in the GUI</text>
+    <rect x="632" y="655" width="26" height="18" fill="#f2f2f2" stroke="#888" stroke-dasharray="6 4"/>
+    <text x="666" y="669" font-size="13" fill="#222">SFP: stock driver, not ours</text>
+  </g>
+
+  <!-- ================= notes ================= -->
+  <text x="40" y="710" font-size="13" fill="#444">Jack numbering follows the vendor table. etherswitch1 port0 (bottom col 3) is the one inferred, not walked.</text>
+  <text x="40" y="734" font-size="13" fill="#444">Switch jacks never log a link change. Only truth: etherswitchcfg -f /dev/etherswitchN phy P.1 → 0x796d linked, 0x7949 idle.</text>
+  <text x="40" y="758" font-size="13" fill="#444">WAN jacks are not switch ports — they appear only as igb4 / igb5 carrier. PHYs negotiate late, so re-read before calling a cell dead.</text>
+  <text x="40" y="782" font-size="13" fill="#444">Only six PCI functions exist on this board. Read your own MACs with ifconfig -m.</text>
+  <text x="40" y="822" font-size="12" fill="#888">Atom C2358 (Rangeley) · coreboot · OPNsense 26.7 / FreeBSD 15.1 · see README.md, "The hardware"</text>
+</svg>
