@@ -1,0 +1,247 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# ---------------------------------------------------------------------------
+# build.sh - compile the VeloCloud VCE520B kernel modules against the
+#            OPNsense source tree prepared by fetch-src.sh + prepare.sh.
+#
+# Run this on OPNsense / FreeBSD (it uses bmake, the FreeBSD toolchain and
+# the host compiler).  It does NOT build a kernel: it produces the four
+# loadable modules in config.mk KMODS (if_vce520b, vc_pcu_gpio, vc_board,
+# vc_mdio) and nothing else. mdio.ko, etherswitch.ko, e6000sw.ko and ichwd.ko
+# are stock OPNsense modules and are copied from the image by
+# scripts/make-stock-usb.sh - rebuilding them here is how a box ends up
+# running a .ko nobody verified.
+#
+#   usage: scripts/build.sh [-j N] [-k KERNDIR] [--clean] [--only "mods"]
+#                           [--list] [--debug]
+#
+#     -k KERNDIR   directory holding the opt_*.h of the kernel you are
+#                  injecting into. Without it the options files are
+#                  synthesised from sys/<arch>/conf/DEFAULTS, exactly like an
+#                  untied "make -C sys/modules" build - which is what a stock
+#                  OPNsense kernel was built with, so that is the normal case.
+#     --debug      keep debug symbols (no OBJCOPY --strip-debug) and do not
+#                  strip the module, so kgdb/crash can read it.
+# ---------------------------------------------------------------------------
+set -eu
+
+. "$(dirname -- "$0")/common.sh"
+
+JOBS=$( (getconf NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) | head -n1 )
+KERNDIR=${KERNBUILDDIR:-}
+ONLY=${ONLY:-}
+DO_CLEAN=0
+VERBOSE=
+DEBUG_FLAGS=
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-j)
+		JOBS=$2
+		shift 2
+		;;
+	-k)
+		KERNDIR=$2
+		shift 2
+		;;
+	--clean)
+		DO_CLEAN=1
+		shift
+		;;
+	--only)
+		ONLY=$2
+		shift 2
+		;;
+	--list)
+		printf '%s\n' $KMODS
+		exit 0
+		;;
+	--debug)
+		DEBUG_FLAGS="DEBUG_FLAGS=-g"
+		shift
+		;;
+	-d|--debug-make)
+		VERBOSE="-d"
+		shift
+		;;
+	-h|--help)
+		sed -n '2,25p' "$0"
+		exit 0
+		;;
+	*)
+		die "unknown option '$1' (try --help)"
+		;;
+	esac
+done
+
+resolve_target
+
+src_is_ready || die "kernel source tree missing - run scripts/fetch-src.sh first"
+
+# ---------------------------------------------------------------------------
+# Refuse to build against an unpatched tree: without the patch, if_em.c has
+# no igb_vc_* devmethods and e6000sw.c has no 88E6176 STU workaround, so the
+# resulting modules would be useless (and if_em.ko would not even link,
+# because igb_vc.c is in SRCS).
+# ---------------------------------------------------------------------------
+grep -q VeloCloud "$SRC/sys/dev/e1000/if_em.c" 2>/dev/null ||
+	die "the patch series is not applied - run scripts/prepare.sh first"
+
+# ---------------------------------------------------------------------------
+# The four module directories are not part of the OPNsense tree:
+#   vce520b     - our Makefile, derived from sys/modules/em/Makefile; it adds
+#                 igb_vc.c, mdio_if.h and builds the file as if_vce520b.ko
+#   vc_pcu_gpio, vc_board, vc_mdio - VeloCloud-only drivers, no upstream
+#                 equivalent
+# Each holds its Makefile and its sources together and is built in place; the
+# objects go to $WORK/obj/<module> via MAKEOBJDIR, so nothing is ever written
+# back into $TOP/src.
+# ---------------------------------------------------------------------------
+
+if [ "$DO_CLEAN" = 1 ]; then
+	log "cleaning $WORK/obj"
+	rm -rf "$WORK/obj"
+fi
+
+mkdir -p "$OUT"
+rm -f "$OUT"/*.ko 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# bmake plumbing.
+#
+#   -m $SRC/share/mk   use the source tree's copy of bsd.kmod.mk & friends
+#                      instead of /usr/share/mk.  This is what makes
+#                      ${SYSDIR}/conf/kmod.mk (kernel module rules) reachable,
+#                      and it also pins SRCTOP := $SRC (share/mk/src.sys.env.mk
+#                      derives SRCTOP from the directory bsd.init.mk was parsed
+#                      out of, so -m doubles as the SRCTOP selector).
+#   SYSDIR             $SRC/sys - bsd.sysdir.mk's autodetection only looks
+#                      relative to .CURDIR, which is wrong for an out-of-tree
+#                      build.
+#   VELOVC             this repo's src/ - where the vc_* headers live, used by
+#                      the module Makefiles. The sources themselves are found
+#                      by .CURDIR, since each Makefile sits with its sources.
+#   NO_SKIP_MPATH    config.mk normally skips
+#                      `find ${SYSDIR} -name '*_if.m'` unless it thinks a real
+#                      build is happening; forcing it guarantees the *_if.h
+#                      files (bus_if.h, device_if.h, pci_if.h, mdio_if.h,
+#                      etherswitch_if.h, miibus_if.h, ofw_bus_if.h, ifdi_if.h)
+#                      get generated by sys/tools/makeobjops.awk.
+#
+# Objects go to $WORK/obj/<module> because MAKEOBJDIR is set explicitly per
+# module.  That is deliberate: left alone, src.sys.obj.mk derives the objdir
+# from OBJROOT/OBJTOP (/usr/obj/<SRCTOP>/amd64.amd64/...) and only expands
+# MAKEOBJDIR after OBJTOP is known, which makes the location hard to predict
+# for an out-of-tree build.  An absolute MAKEOBJDIR short-circuits all of it.
+# ---------------------------------------------------------------------------
+MKARGS="
+	-m $SRC/share/mk
+	SRCTOP=$SRC
+	SYSDIR=$SRC/sys
+	VELOVC=$TOP/src
+	NO_SKIP_MPATH=1
+	$DEBUG_FLAGS
+"
+
+if [ -n "$KERNDIR" ]; then
+	[ -d "$KERNDIR" ] || die "kernel build directory $KERNDIR does not exist"
+	[ -f "$KERNDIR/opt_global.h" ] ||
+		warn "$KERNDIR has no opt_global.h - KERNBUILDDIR may be wrong"
+	log "using kernel options from $KERNDIR"
+	MKARGS="$MKARGS KERNBUILDDIR=$KERNDIR"
+fi
+
+# Where each module's Makefile lives. All four of ours are in $TOP/src, built
+# in place; anything else would come out of the src tree (there is nothing
+# else - the stock mdio/etherswitch/e6000sw/ichwd .ko files are copied from the
+# OPNsense image by scripts/make-stock-usb.sh, never built here).
+module_dir() {
+	case "$1" in
+	vce520b|vc_pcu_gpio|vc_board|vc_mdio) printf '%s/%s' "$TOP/src" "$1" ;;
+	*)                                    printf '%s/sys/modules/%s' "$SRC" "$1" ;;
+	esac
+}
+
+# Module name (config.mk KMODS) -> artefact name produced by bmake (KMOD).
+# vce520b is the module name; its file is if_vce520b.ko, and the driver name
+# registered inside it is still `igb`, which is what keeps the interfaces
+# igb0..igb5. See README, "Driver naming".
+module_ko() {
+	case "$1" in
+	vce520b) printf 'if_vce520b.ko' ;;
+	*)       printf '%s.ko' "$1" ;;
+	esac
+}
+
+log "target: OPNsense $OPNSENSE_TARGET (src $SRC_BRANCH, FreeBSD $FREEBSD_VER, patch set $PATCHSET)"
+log "objects: $WORK/obj   artefacts: $OUT   jobs: $JOBS"
+
+built=
+failed=
+for m in $KMODS; do
+	if [ -n "$ONLY" ]; then
+		case " $ONLY " in
+		*" $m "*) ;;
+		*) continue ;;
+		esac
+	fi
+
+	dir=$(module_dir "$m")
+	[ -f "$dir/Makefile" ] || die "no Makefile for module '$m' in $dir"
+
+	objdir="$WORK/obj/$m"
+	mkdir -p "$objdir"
+	ko=$(module_ko "$m")
+	# Remove stale artefacts so the search below cannot pick up an older build.
+	rm -f "$objdir/$ko" "$dir/$ko"
+
+	log "building $m  ($dir -> $objdir)"
+	# shellcheck disable=SC2086
+	if [ "$DO_CLEAN" = 1 ]; then
+		make -C "$dir" $MKARGS MAKEOBJDIR="$objdir" clean || true
+	fi
+	if ! make -C "$dir" $MKARGS MAKEOBJDIR="$objdir" -j "$JOBS" all; then
+		failed="$failed $m"
+		continue
+	fi
+
+	found=
+	for cand in "$objdir/$ko" "$dir/$ko"; do
+		[ -f "$cand" ] && { found="$cand"; break; }
+	done
+	[ -n "$found" ] || die "build of $m reported success but $ko was not found"
+
+	cp "$found" "$OUT/$ko"
+	built="$built $ko"
+done
+
+printf '\n'
+if [ -n "$failed" ]; then
+	printf '\033[1;31mFAILED:\033[0m%s\n' "$failed"
+	printf 'the modules above did not compile; the ones that did are in %s\n' "$OUT"
+	exit 1
+fi
+
+log "built:$built"
+ls -l "$OUT"
+
+cat <<EOF
+
+Two install paths, same discipline as a kernel swap (docs/STORAGE.md 4):
+
+  New media:  sh scripts/make-stock-usb.sh --with-kmods   # a FreeBSD host, root
+              sh scripts/make-stock-usb.sh --verify       # re-check, changes nothing
+
+  Running box: sftp these .ko plus scripts/install-kmods.sh plus config.mk to
+               one directory on the box, then
+               sh <dir>/install-kmods.sh <dir>
+               - backs up the outgoing set with both md5s, checks the symbols
+                 against the running kernel, atomic rename, kldxref, --rollback.
+               --grow-root grows the root slice. Needed on the serial base: rc
+               only grows if /.probe.for.growfs exists, and the serial image
+               does not ship it (STORAGE.md 2). Nothing here remounts anything -
+               the mount state belongs to the base image, and on serial that is
+               ro, with rc unioning boot/conf/etc/home/root/usr/var over tmpfs.
+
+EOF

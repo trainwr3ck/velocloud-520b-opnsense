@@ -1,0 +1,9 @@
+work/
+out/
+*.img
+*.img.bz2
+*.ko
+*.o
+*.abi
+.depend
+obj/

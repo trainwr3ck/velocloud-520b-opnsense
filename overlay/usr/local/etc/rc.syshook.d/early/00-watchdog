@@ -1,0 +1,97 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Earliest userspace touch of the Rangeley watchdog. OPNsense runs
+# rc.syshook.d/early/* before any daemon starts, which is the first hook we get.
+#
+# Default mode is SERVICING: re-arm the hardware timer forever, so the box is
+# genuinely protected for its whole life. Disabling is only a bring-up fallback
+# (VCE520B_WDT_MODE=disable) - with the dog off, a hung OPNsense stays hung.
+#
+# Why this exists at all: on a healthy attach ichwd_attach() calls
+# ichwd_tmr_disable() during newbus attach, so the firmware-armed timer is
+# already halted long before this script runs. This script covers the gap
+# between kernel attach and watchdogd starting, and it reports the case where
+# ichwd never attached and the firmware timer is still running untouched.
+#
+# SEMANTICS THAT ARE EASY TO GET WRONG (verified against FreeBSD 15.1):
+#   watchdog -d    -> DEBUGGING, not disable. Does nothing to the timer.
+#   watchdog -t 0  -> the actual disable (WD_TO_NEVER).
+#   watchdog -t N  -> arm with an N-second period.
+#
+# THE NODE. FreeBSD 15 names the watchdog cdev /dev/fido: sys/sys/watchdog.h:37
+# defines _PATH_WATCHDOG as "fido". There is no /dev/watchdog on this base, and
+# this project targets FreeBSD 15 only, so no legacy path is probed. Getting the
+# path wrong is not cosmetic: a missing node here means userspace cannot service
+# or disarm the dog, and the firmware timer will bite. Verify with tests/wdstate
+# (WDIOC_GETTIMELEFT sawtooth, 0-25 s, resetting at exactly the 30 s nap) rather
+# than by trusting a presence test.
+DEV=/dev/fido
+CONF=/usr/local/etc/vce520b-wdt.conf
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# Defaults. The config file overrides them; the environment overrides that, so
+# you can flip modes from a serial console without editing anything.
+MODE=service
+PERIOD=120
+NAP=30
+
+# Keep this a power of two, or just under one. The kernel rounds the request up
+# to the next power of two in NANOSECONDS and ichwd reads it back as 1.0 s TCOv3
+# ticks, so 120 -> 2^37 ns -> 137s and 180 -> 2^38 ns -> 274s.
+if [ -f "$CONF" ]; then
+	# shellcheck disable=SC1090
+	. "$CONF"
+fi
+MODE="${VCE520B_WDT_MODE:-$MODE}"
+PERIOD="${VCE520B_WDT_PERIOD:-$PERIOD}"
+NAP="${VCE520B_WDT_NAP:-$NAP}"
+
+say() {
+	printf 'vce520b-wdt: %s\n' "$1"
+	[ -x /usr/bin/logger ] && /usr/bin/logger -t vce520b-wdt -- "$1"
+	return 0
+}
+
+(
+	if [ ! -c "$DEV" ]; then
+		# No /dev/fido. The watchdog core is a DEV_MODULE, so the node
+		# appears only on MOD_LOAD: no node means the core is not loaded,
+		# and userspace cannot help. The firmware timer will bite.
+		say "MISSING $DEV - cannot service or disarm"
+		say "expect a reboot; check: dmesg | grep -i ichwd"
+		exit 1
+	fi
+
+	if [ "$MODE" = disable ]; then
+		# Bring-up only. watchdog(4): on failure the dog may STILL be armed.
+		if watchdog -t 0 2>/dev/null; then
+			say "DISARMED via $DEV (debug mode - box is NOT protected)"
+		else
+			say "FAILED to disarm via $DEV - firmware timer may still run"
+		fi
+		exit 0
+	fi
+
+	# Servicing. Hand off to watchdogd as soon as it is up: it has the
+	# pretimeout console warning, which this crude loop cannot do.
+	say "servicing $DEV: period ${PERIOD}s, pat every ${NAP}s"
+	stuck=0
+	while true; do
+		if pgrep -x watchdogd >/dev/null 2>&1; then
+			say "watchdogd is up - handing off"
+			exit 0
+		fi
+		if watchdog -t "$PERIOD" 2>/dev/null; then
+			stuck=0
+		else
+			stuck=$((stuck + 1))
+			if [ "$stuck" -eq 1 ]; then
+				say "WARNING: watchdog -t $PERIOD failed" \
+					"(ichwd may have refused: NO_REBOOT bit set)"
+			fi
+		fi
+		sleep "$NAP"
+	done
+) >/dev/console 2>&1 &

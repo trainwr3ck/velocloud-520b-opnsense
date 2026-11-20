@@ -1,0 +1,165 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Switch bring-up for the VeloCloud Edge 520B.
+#
+# The 10 GbE LAN ports are not netdevs. They are ports of two Marvell 88E6176
+# switches hanging off the Intel I354's internal MDIO bus, reached through the
+# patched if_em (igb_vc.c registers an mdio bus on functions 0 and 1) and
+# driven by e6000sw. FreeBSD's etherswitch is control-plane only: e6000sw calls
+# if_alloc()/if_initname() per port but never if_attach()/ether_ifattach(), so
+# there is no ifnet per switch port and the OPNsense GUI never sees them.
+# Traffic egresses through the igb uplink netdev; the switch does the fan-out
+# in hardware. That is the same model the vendor uses - its OpenWrt
+# /etc/config/network defines exactly four ifaces (eth0 dsl, eth1 lan bridge,
+# eth2 cm, eth3 sfp) for twelve physical ports.
+#
+# So this script's job is to make sure the switch is actually bridging, and to
+# dump enough state that a wrong CPU-port guess in the kernel hints is obvious
+# on the serial console.
+#
+# WHAT STOCK e6000sw ALREADY DOES: e6000sw_init_vlan() disables every port,
+# flushes the VTU, then for every enabled port assigns
+#   members = all other enabled ports, FID 0
+# which is a flat bridge. With the port<N>cpu / port<N>disabled hints in
+# /boot/loader.conf.d/vce520b-switch.conf that is already the vendor behaviour,
+# so the default mode here is VERIFY ONLY - it changes nothing.
+#
+# etherswitchcfg grammar (verified against sbin/etherswitchcfg/etherswitchcfg.c
+# in opnsense/src stable/26.7):
+#   etherswitchcfg [-f file] [-v] info
+#   etherswitchcfg -f file config vlan_mode isl|port|dot1q|dot1q4k|qinq
+#   etherswitchcfg -f file vlangroupN vlan <vid>
+#   etherswitchcfg -f file vlangroupN members <p>[t][,<p>[t]]...   't' = tagged
+#   etherswitchcfg -f file portN pvid <vid> | media ... | addtag | striptag ...
+#   etherswitchcfg -f file reg <addr>[=<val>]     phy <reg>[=<val>]
+#
+# CAVEAT that constrains PORT mode: e6000sw_set_port_vlan() rejects
+# es_member_ports != es_untagged_ports with "Tagged ports not supported.", and
+# in PORT mode the vlangroup unit IS the port number and the VID is forced to
+# port+1. Tagged uplinks therefore require `config vlan_mode dot1q`, which
+# re-programs every port - do that only once the topology is confirmed.
+#
+# Everything here is best-effort: a failure must never block boot, and the
+# watchdog feeder (00-watchdog) has to keep running.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+CONF=/usr/local/etc/vce520b-switch.conf
+ESWCfg=/sbin/etherswitchcfg
+
+# Defaults; $CONF overrides, the environment overrides that, so the topology
+# can be retuned from a serial console without editing or reflashing.
+MODE=verify
+WAIT=20
+UNITS="0 1"
+SPEC=/usr/local/etc/vce520b-switch.spec
+
+if [ -f "$CONF" ]; then
+	# shellcheck disable=SC1090
+	. "$CONF"
+fi
+MODE="${VCE520B_SWITCH_MODE:-$MODE}"
+WAIT="${VCE520B_SWITCH_WAIT:-$WAIT}"
+SPEC="${VCE520B_SWITCH_SPEC:-$SPEC}"
+
+say() {
+	printf 'vce520b-switch: %s\n' "$1"
+	[ -x /usr/bin/logger ] && /usr/bin/logger -t vce520b-switch -- "$1"
+	return 0
+}
+
+# Wait for the switches to attach. rc.syshook.d/early runs before the network
+# daemons but after kldxref/loader.conf module loading, so e6000sw should
+# already be up; the loop covers the case where it is a late kld.
+wait_for() {
+	i=0
+	while [ "$i" -lt "$WAIT" ]; do
+		[ -c "$1" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+dump() {
+	dev=$1
+	say "--- $dev info ---"
+	$ESWCfg -f "$dev" -v info 2>&1 | sed 's/^/    /'
+	say "--- $dev port/VLAN registers of interest ---"
+	# REG_GLOBAL-ish reads are driver specific; `reg` takes a raw address and
+	# an unknown address is simply rejected, so this is safe to attempt.
+	for r in 0x0 0x1b 0x1c 0x1d; do
+		printf '    reg %s = ' "$r"
+		$ESWCfg -f "$dev" reg "$r" 2>&1 | head -n 1
+	done
+}
+
+# $SPEC format: one etherswitchcfg invocation per line, first token is the
+# etherswitch unit number, the rest are literal etherswitchcfg arguments.
+#   0 config vlan_mode dot1q
+#   0 vlangroup0 vlan 1 members 0,1,2,3,4t
+# Blank lines and '#' comments are ignored.
+configure() {
+	[ -n "$SPEC" ] && [ -f "$SPEC" ] || {
+		say "MODE=$MODE but SPEC=$SPEC does not exist - nothing applied"
+		return 1
+	}
+	# Strip comments/blank lines first so the read loop only sees commands.
+	sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$SPEC" |
+	while IFS= read -r line; do
+		set -- $line
+		unit=$1
+		shift
+		[ "$#" -gt 0 ] || continue
+		case $unit in
+		[0-9]*) ;;
+		*) say "skipping malformed SPEC line: $line"; continue ;;
+		esac
+		say "etherswitch$unit: $*"
+		$ESWCfg -f "/dev/etherswitch$unit" "$@" 2>&1 | sed 's/^/    /'
+	done
+	return 0
+}
+
+(
+	if [ ! -x "$ESWCfg" ]; then
+		say "MISSING $ESWCfg - base system etherswitchcfg not installed"
+		exit 1
+	fi
+
+	found=0
+	for u in $UNITS; do
+		if ! wait_for "/dev/etherswitch$u"; then
+			say "no /dev/etherswitch$u after ${WAIT}s - e6000sw did not attach"
+			say "check: dmesg | grep -E 'igb[0-9]|mdio[0-9]|e6000sw'"
+			continue
+		fi
+		found=$((found + 1))
+		say "/dev/etherswitch$u is up"
+		dump "/dev/etherswitch$u"
+	done
+
+	if [ "$found" = 0 ]; then
+		say "no switches found - nothing to configure"
+		exit 1
+	fi
+
+	case $MODE in
+	verify)
+		say "mode=verify: leaving stock e6000sw flat bridge in place"
+		say "stock e6000sw_init_vlan() already bridges every enabled port"
+		say "to change membership: set MODE=configure in $CONF"
+		;;
+	configure|apply)
+		# SPEC lines carry their own unit number, so apply once, not per unit.
+		configure
+		for u in $UNITS; do
+			[ -c "/dev/etherswitch$u" ] && dump "/dev/etherswitch$u"
+		done
+		say "mode=$MODE: applied $SPEC"
+		;;
+	*)
+		say "unknown MODE=$MODE - expected verify|configure"
+		;;
+	esac
+) >/dev/console 2>&1 &

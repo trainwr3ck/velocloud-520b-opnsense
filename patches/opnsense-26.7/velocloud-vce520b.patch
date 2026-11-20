@@ -1,0 +1,153 @@
+diff --git a/sys/dev/e1000/e1000_82575.c b/sys/dev/e1000/e1000_82575.c
+index 47b80063..c32ae62d 100644
+--- a/sys/dev/e1000/e1000_82575.c
++++ b/sys/dev/e1000/e1000_82575.c
+@@ -196,6 +196,18 @@ static s32 e1000_init_phy_params_82575(struct e1000_hw *hw)
+ 	E1000_WRITE_REG(hw, E1000_CTRL_EXT, ctrl_ext);
+ 	e1000_reset_mdicnfg_82580(hw);
+ 
++	/*
++	 * VeloCloud probe: if this is an I354 on a VeloCloud board,
++	 * igb_vc_probe() overrides phy.ops.read_reg/write_reg to use
++	 * GPIO bitbang MDIO and pre-fills phy.addr and phy.id.
++	 * Returns 1 if VeloCloud WAN port detected (skip MDIO setup
++	 * and PHY ID detection below), 0 otherwise.
++	 */
++	{ extern s32 igb_vc_probe(struct e1000_hw *);
++	  if (igb_vc_probe(hw))
++		goto vc_phy_ready;
++	}
++
+ 	if (e1000_sgmii_active_82575(hw) && !e1000_sgmii_uses_mdio_82575(hw)) {
+ 		phy->ops.read_reg = e1000_read_phy_reg_sgmii_82575;
+ 		phy->ops.write_reg = e1000_write_phy_reg_sgmii_82575;
+@@ -220,6 +232,26 @@ static s32 e1000_init_phy_params_82575(struct e1000_hw *hw)
+ 
+ 	/* Set phy->phy_addr and phy->id. */
+ 	ret_val = e1000_get_phy_id_82575(hw);
++vc_phy_ready:
++
++	/*
++	 * VeloCloud switch port (func0/func1): phy->id is 0,
++	 * media_type is internal_serdes.  No PHY to initialize ->
++	 * the 88E6176 switch is managed via e6000sw/mdio, not
++	 * the e1000 PHY layer.
++	 *
++	 * Override setup_physical_interface to use forced SGMII link.
++	 * The I354-to-88E6176 is MAC-to-MAC SGMII which requires
++	 * forced 1000/FD with PCS autoneg disabled.
++	 */
++	if (phy->id == 0 &&
++	    phy->media_type == e1000_media_type_internal_serdes) {
++		{ extern s32 igb_vc_setup_sgmii_forced(struct e1000_hw *);
++		  hw->mac.ops.setup_physical_interface =
++		      igb_vc_setup_sgmii_forced; }
++		DEBUGOUT("VeloCloud switch port -> skipping PHY init\n");
++		return E1000_SUCCESS;
++	}
+ 
+ 	/* Verify phy id and set remaining function pointers */
+ 	switch (phy->id) {
+@@ -301,6 +333,8 @@ static s32 e1000_init_phy_params_82575(struct e1000_hw *hw)
+ 	case M88E1512_E_PHY_ID:
+ 	{
+ 		ret_val = e1000_initialize_M88E1512_phy(hw);
++		{ extern void igb_vc_configure_leds(struct e1000_hw *);
++		  igb_vc_configure_leds(hw); }
+ 		break;
+ 	}
+ 	case M88E1543_E_PHY_ID:
+@@ -736,8 +770,11 @@ static s32 e1000_phy_hw_reset_sgmii_82575(struct e1000_hw *hw)
+ 	if (ret_val)
+ 		goto out;
+ 
+-	if (phy->id == M88E1512_E_PHY_ID)
++	if (phy->id == M88E1512_E_PHY_ID) {
+ 		ret_val = e1000_initialize_M88E1512_phy(hw);
++		{ extern void igb_vc_configure_leds(struct e1000_hw *);
++		  igb_vc_configure_leds(hw); }
++	}
+ out:
+ 	return ret_val;
+ }
+diff --git a/sys/dev/e1000/if_em.c b/sys/dev/e1000/if_em.c
+index 23b7e3ff..99c0d3aa 100644
+--- a/sys/dev/e1000/if_em.c
++++ b/sys/dev/e1000/if_em.c
+@@ -30,6 +30,8 @@
+ #include "if_em.h"
+ #include <sys/sbuf.h>
+ #include <machine/_inttypes.h>
++#include <dev/mdio/mdio.h>
++#include "mdio_if.h"
+ 
+ #define em_mac_min e1000_82571
+ #define igb_mac_min e1000_82575
+@@ -514,6 +516,12 @@ static device_method_t em_methods[] = {
+ 	DEVMETHOD_END
+ };
+ 
++/* VeloCloud MDIO bus methods (igb_vc.c) */
++extern int igb_vc_mdio_readreg(device_t dev, int phy, int reg);
++extern int igb_vc_mdio_writereg(device_t dev, int phy, int reg, int val);
++extern device_t igb_vc_bus_add_child(device_t dev, u_int order,
++    const char *name, int unit);
++
+ static device_method_t igb_methods[] = {
+ 	/* Device interface */
+ 	DEVMETHOD(device_register, igb_register),
+@@ -523,6 +531,11 @@ static device_method_t igb_methods[] = {
+ 	DEVMETHOD(device_shutdown, iflib_device_shutdown),
+ 	DEVMETHOD(device_suspend, iflib_device_suspend),
+ 	DEVMETHOD(device_resume, iflib_device_resume),
++	/* Bus interface: only allow mdio child on switch ports */
++	DEVMETHOD(bus_add_child, igb_vc_bus_add_child),
++	/* MDIO bus for VeloCloud 88E6176 switch access */
++	DEVMETHOD(mdio_readreg, igb_vc_mdio_readreg),
++	DEVMETHOD(mdio_writereg, igb_vc_mdio_writereg),
+ 	DEVMETHOD_END
+ };
+ 
+@@ -544,10 +557,12 @@ static driver_t igb_driver = {
+ };
+ 
+ DRIVER_MODULE(igb, pci, igb_driver, 0, 0);
++DRIVER_MODULE(mdio, igb, mdio_driver, 0, 0);
+ 
+ MODULE_DEPEND(igb, pci, 1, 1, 1);
+ MODULE_DEPEND(igb, ether, 1, 1, 1);
+ MODULE_DEPEND(igb, iflib, 1, 1, 1);
++MODULE_DEPEND(igb, mdio, 1, 1, 1);
+ 
+ IFLIB_PNP_INFO(pci, igb, igb_vendor_info_array);
+ 
+@@ -1377,6 +1392,16 @@ em_if_attach_post(if_ctx_t ctx)
+ 	}
+ 
+ 	em_reset(ctx);
++	/* VeloCloud: verify switch MDIC access after hardware reset */
++	{ extern void igb_vc_verify_switch(struct e1000_hw *);
++	  igb_vc_verify_switch(hw); }
++
++	/*
++	 * VeloCloud: build the mdio(4) bus under the switch functions.  newbus
++	 * never does it for igb - see the comment on igb_vc_attach_mdio_bus().
++	 */
++	{ extern void igb_vc_attach_mdio_bus(device_t);
++	  igb_vc_attach_mdio_bus(sc->dev); }
+ 
+ 	/* Initialize statistics */
+ 	if (sc->vf_ifp)
+@@ -2106,11 +2131,11 @@ em_if_set_promisc(if_ctx_t ctx, int flags)
+ 
+ 	if (flags & IFF_PROMISC) {
+ 		reg_rctl |= (E1000_RCTL_UPE | E1000_RCTL_MPE);
++		em_if_vlan_filter_disable(sc);
+ 		/* Turn this on if you want to see bad packets */
+ 		if (em_debug_sbp)
+ 			reg_rctl |= E1000_RCTL_SBP;
+ 		E1000_WRITE_REG(&sc->hw, E1000_RCTL, reg_rctl);
+-		em_if_vlan_filter_disable(sc);
+ 	} else {
+ 		if (flags & IFF_ALLMULTI) {
+ 			reg_rctl |= E1000_RCTL_MPE;

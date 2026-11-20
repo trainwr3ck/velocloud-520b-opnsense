@@ -1,0 +1,107 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Boot diagnostic dump for the VeloCloud Edge 520B bring-up.
+#
+# Runs as an rc.syshook.d/early hook, i.e. before any daemon starts and well
+# inside the ~3 minute firmware watchdog deadline, so the output exists even
+# if the box is about to fail. Everything goes to the serial console where it
+# can be copied out of the terminal, and to /var/log/vce520b-probe.txt.
+#
+# Deliberately stock-only: no VeloCloud drivers are assumed. On a stock
+# OPNsense 26.7 boot this answers the three questions the whole port depends
+# on - what the I354 enumerates as, whether any mdio bus appears under it,
+# and whether the Rangeley watchdog attached.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+OUT=/var/log/vce520b-probe.txt
+
+banner() {
+	printf '\n===== %s =====\n' "$1"
+}
+
+# Run a command, echoing it and its output. Never abort the dump over one
+# missing tool - a gap in the output is itself information.
+run() {
+	printf '\n--- $ %s\n' "$*"
+	"$@" 2>&1 || printf '(exit %s)\n' "$?"
+}
+
+dump() {
+	banner "VCE520B PROBE $(date)"
+
+	run uname -a
+	run sysctl kern.version
+
+	banner "WATCHDOG"
+	# The single most important line in this whole dump.
+	# bootverbose is on, so ichwd's own verbose lines are present, and they
+	# are the definitive answer to "disarmed or serviced?":
+	#   "timer disabled"       -> ichwd_attach() halted the firmware-armed timer
+	#   "timer enabled"        -> something RE-ARMED it: the dog is live
+	#   "timeout set to N ticks" -> the real deadline; -t 120 gives 137
+	run sh -c "dmesg | grep -iE 'ichwd|watchdog|timeout'"
+	run sh -c "kldstat | grep -iE 'ichwd|wdt' || echo 'ichwd NOT loaded'"
+	# FreeBSD 15 names the watchdog cdev /dev/fido: _PATH_WATCHDOG is "fido"
+	# (sys/sys/watchdog.h:37). There is no /dev/watchdog on this base.
+	run ls -l /dev/fido
+	# These three oids CANNOT answer "is the dog being serviced":
+	#   wd_last_msecs    always 0 - wd_last_sbt_sysctl is sysctl-bound in
+	#                    sys/dev/watchdog/watchdog.c but never assigned.
+	#   wd_last_u[_secs] the last requested PERIOD, not a pet timestamp.
+	# The pet timestamp is wd_lastpat, which is not exported as a sysctl.
+	# Read it with tests/wdstate (WDIOC_GETTIMELEFT): it returns ENOENT if
+	# no hardware handler has ever accepted a pat, otherwise seconds SINCE
+	# the last one. Sampling every 5 s across watchdogd's -s 30 nap shows a
+	# 0-25 s sawtooth when the dog is live. `sysctl kern.watchdog` is
+	# simply invalid on this release.
+	run sysctl hw.watchdog
+	run pgrep -al watchdogd
+	run cat /etc/rc.conf.d/watchdogd
+
+	banner "PCI - what the I354 and the SoC enumerate as"
+	# -lv gives subvendor/device names. The 520B's NIC is an Intel I354 with
+	# four functions; functions 0/1 hang 88E6176 switches off the NIC's own
+	# internal MDIO, which is what our igb_vc patch drives.
+	run pciconf -lv
+	run sh -c "pciconf -l | grep -iE 'igb|em|e1000|none'"
+	run sh -c "dmesg | grep -iE 'igb|e1000|em[0-9]|pci[0-9]'"
+
+	banner "NETWORK INTERFACES"
+	run ifconfig -a
+	run sh -c "dmesg | grep -iE 'igb[0-9]|em[0-9]|mdio|e6000sw|etherswitch|e1000'"
+	run ls -l /dev/etherswitch* /dev/mdio*
+	run sh -c "ls /sys/class/net 2>/dev/null || true"
+
+	banner "NEWBUS TREE - is there an mdio child under igb?"
+	# `devinfo` is the definitive answer to whether the mdio bus the switches
+	# need exists at all. Without it e6000sw can never attach.
+	run sh -c "devinfo -rv 2>/dev/null | grep -iE 'igb|em[0-9]|mdio|e6000sw|etherswitch|mii' || echo 'no mdio/e6000sw in the tree'"
+
+	banner "MODULES"
+	run kldstat
+	run sh -c "ls /boot/modules 2>/dev/null || echo 'no /boot/modules'"
+
+	banner "SERIAL / CONSOLE"
+	run sysctl kern.console hw.uart
+	run sh -c "dmesg | grep -i uart"
+	run sh -c "kenv | grep -iE 'console|uart|smbios' || echo 'no matching kenv'"
+
+	banner "SMBIOS - vc_board keys off these"
+	run sh -c "sysctl smbios 2>/dev/null | grep -iE 'product|version|vendor|planar' || kenv | grep -i smbios"
+
+	banner "STORAGE / BOOT"
+	run gpart show
+	run df -h
+	run sh -c "gpart list 2>/dev/null | grep -iE 'name|scheme|index|start|size' | head -40"
+
+	banner "END PROBE"
+}
+
+# Print to the console AND keep a copy. `logger` would only land in syslog,
+# which is exactly what we cannot read if the box reboots.
+{
+	dump
+} 2>&1 | tee "$OUT"
+
+exit 0
