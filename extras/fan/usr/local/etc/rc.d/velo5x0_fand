@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# PROVIDE: velo5x0_fand
+# REQUIRE: FILESYSTEMS syslogd
+# KEYWORD: shutdown
+#
+# velo5x0 OPNsense fan control. Shipped DISABLED;
+# enable only after `velo5x0-fan probe` shows identified = 1, by setting
+#   /etc/rc.conf.d/velo5x0_fand:  velo5x0_fand_enable="YES"
+# OPNsense starts it from rc.syshook start -> rc.freebsd start, and stops it
+# from rc.syshook stop -> rc.freebsd stop at every shutdown and reboot.
+#
+# daemon(8) supervises the Python loop and restarts it 5 s after any exit
+# (-r -R 5). stop: SIGTERM to the supervisor (forwarded; the loop writes full
+# duty and exits), then `velo5x0-fan full` as a second, independent write.
+# A crash, kill -9 or hang between those is covered by the vc_fan kernel
+# watchdog (30 s) and, at shutdown, by vc_fan's shutdown_pre_sync and
+# shutdown_final handlers (pre_sync runs before any crash dump).
+
+. /etc/rc.subr
+
+name="velo5x0_fand"
+rcvar="velo5x0_fand_enable"
+load_rc_config $name
+
+: ${velo5x0_fand_enable:="NO"}
+
+pidfile="/var/run/${name}.pid"
+childpid="/var/run/${name}.child.pid"
+fan="/usr/local/sbin/velo5x0-fan"
+command="/usr/sbin/daemon"
+command_args="-r -R 5 -S -T velo5x0-fan -P ${pidfile} -p ${childpid} ${fan} run"
+procname="daemon"
+
+start_precmd="${name}_prestart"
+stop_postcmd="${name}_poststop"
+extra_commands="full probe"
+full_cmd="${name}_full"
+probe_cmd="${fan} probe"
+
+velo5x0_fand_alert()
+{
+	# an alert must reach a person even before or without syslog
+	mkdir -p /var/run/velo5x0-fan
+	echo "$(date +%Y-%m-%dT%H:%M:%S%z) $*" >> /var/run/velo5x0-fan/ALERT
+	echo "velo5x0-fan: ALERT: $*" > /dev/console
+	logger -p daemon.crit -t velo5x0-fan "ALERT: $*"
+}
+
+velo5x0_fand_prestart()
+{
+	if ! kldstat -q -m vc_fan; then
+		velo5x0_fand_alert "vc_fan kernel module not loaded; fan not controlled"
+		return 1
+	fi
+	# never start (and so never restart-loop) without an identified chip
+	if [ "$(sysctl -n hw.vc_fan.identified 2>/dev/null)" != "1" ]; then
+		echo "${name}: no identified EMC2104 (hw.vc_fan.identified != 1); not starting"
+		return 1
+	fi
+	if ! sysctl -n dev.cpu.0.temperature >/dev/null 2>&1; then
+		velo5x0_fand_alert "coretemp not loaded: the service will hold full duty"
+	fi
+	return 0
+}
+
+velo5x0_fand_poststop()
+{
+	${fan} full --why "rc.d stop" || \
+	    velo5x0_fand_alert "rc.d stop could not verify full duty"
+}
+
+velo5x0_fand_full()
+{
+	${fan} full --why "rc.d full"
+}
+
+run_rc_command "$1"

@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Load vc_fan once vc_pcu_gpio and vc_board are loaded (they come from
+# loader.conf.d, see scripts/install-kmods.sh). Loading vc_fan releases the fan
+# supply gate first, so the fan runs full until the daemon takes over.
+# vc_fan depends only on vc_pcu_gpio, and refuses to load if vc_board has not
+# run; this hook loads it only when BOTH are already loaded.
+# NEVER put vc_fan in loader.conf / loader.conf.d.
+alert()
+{
+	# syslogd is not up yet in early hooks: console + ALERT file
+	mkdir -p /var/run/velo5x0-fan
+	echo "$(date +%Y-%m-%dT%H:%M:%S%z) $*" >> /var/run/velo5x0-fan/ALERT
+	echo "velo5x0-fan: ALERT: $*" > /dev/console
+}
+if ! kldstat -q -m vc_pcu_gpio || ! kldstat -q -m vc_board; then
+	alert "vc_pcu_gpio/vc_board not loaded: vc_fan NOT loaded, fan not controlled"
+	exit 0
+fi
+kldstat -q -m vc_fan || kldload /boot/modules/vc_fan.ko || \
+    alert "vc_fan.ko did not load; fan not controlled"
+exit 0

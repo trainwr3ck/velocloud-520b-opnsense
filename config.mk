@@ -22,13 +22,17 @@ SRC_REPO          ?= https://github.com/opnsense/src.git
 # patch series touches two files under sys/dev/e1000.  mdio, etherswitch,
 # e6000sw and ichwd are used as OPNsense ships them.
 # ---------------------------------------------------------------------------
-KMODS = vce520b vc_pcu_gpio vc_board vc_mdio
+KMODS = vce520b vc_pcu_gpio vc_board vc_mdio vc_fan
 
 # `vce520b` is the module name (if_vce520b.ko); the newbus driver name inside
 # it is `igb`, so the interfaces stay igb0..igb5.
 
 # Stock modules we depend on and do not replace.
 STOCK_KMODS = mdio etherswitch e6000sw ichwd
+
+# vc_fan (fan control, see docs/fan.md) is built with the others but is
+# deliberately NOT in BOOT_KMODS: it is loaded by its rc.syshook early hook once
+# the modules below are up, never from loader.conf.
 
 # Load order.
 BOOT_KMODS = vc_pcu_gpio vc_board vc_mdio vce520b
