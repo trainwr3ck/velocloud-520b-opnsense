@@ -131,7 +131,7 @@ fi
 # OPNsense image by scripts/make-stock-usb.sh, never built here).
 module_dir() {
 	case "$1" in
-	vce520b|vc_pcu_gpio|vc_board|vc_mdio) printf '%s/%s' "$TOP/src" "$1" ;;
+	vce520b|vc_pcu_gpio|vc_board|vc_mdio|vc_fan) printf '%s/%s' "$TOP/src" "$1" ;;
 	*)                                    printf '%s/sys/modules/%s' "$SRC" "$1" ;;
 	esac
 }
