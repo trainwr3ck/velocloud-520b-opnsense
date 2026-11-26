@@ -125,6 +125,8 @@ src/vce520b/              if_vce520b.ko: e1000 driver + igb_vc.c glue
 src/vc_mdio/              bit-banged MDIO bus on SoC PCU GPIO
 src/vc_pcu_gpio/          Rangeley/Avoton PCU GPIO register driver
 src/vc_board/             board identity + PCA9557 expander
+src/vc_fan/               optional EMC2104 fan control (Edge 520 v2), see docs/fan.md
+extras/fan/               fan daemon, rc.d script and early hook, laid out as on the box
 ```
 
 Each `src/<module>/` holds its Makefile and sources together and builds in place, with

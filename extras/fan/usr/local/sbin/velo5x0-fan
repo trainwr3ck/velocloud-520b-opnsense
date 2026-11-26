@@ -1,0 +1,1063 @@
+#!/usr/local/bin/python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""velo5x0-fan (OPNsense / FreeBSD): temperature-driven control of the EMC2104
+fan on a VeloCloud Edge 5x0 rev B, through the vc_fan kernel module.
+
+The bus is the vc_fan sysctl surface (hw.vc_fan.*), the CPU sensor is sysctl
+dev.cpu.N.temperature (coretemp), and the supervision is daemon(8) + an rc.d
+script + the kernel watchdog.
+
+Curve mode (Edge 540) and on/off mode (Edge 520 v2: duty only 0/255, bit 7 of
+the 0x1c PCA9557 driven by vc_fan at configure).
+
+Subcommands
+  run     the control loop (started by /usr/local/etc/rc.d/velo5x0_fand)
+  full    the fail-safe: write 255, verify after the spin-up time; reads no
+          configuration file (rc.d stop, by hand)
+  probe   read-only dump: hw.vc_fan.*, CPU temperatures, drives
+  set N   supervised manual duty for a control test: refused while the
+          service runs (unless --force); arms the kernel watchdog for 30 s,
+          writes N, prints duty/tach/temps every 2 s for --hold seconds, then
+          writes 255 and verifies; never disarms
+  load    the guarded hand load of vc_fan.ko (vc_pcu_gpio AND vc_board must
+          already be loaded)
+
+Requirements kept here (numbers are the README's F-list and the spec's):
+  * nothing is written unless hw.vc_fan.identified is 1 (0xfd read 0x1d);
+  * the fan is either off (0) or at or above stall_free_duty;
+  * duty written = max(CPU demand, drive demand);
+  * a CPU sensor read error -> full (F1); any control failure -> full, exit 1
+    (F2); SIGTERM/SIGINT -> full, exit 0 (F3); a crash, kill -9 or hang ->
+    the kernel watchdog writes 255 within watchdog_s (F4, F5);
+  * the kernel refuses any duty below 255 unless the watchdog is armed, a
+    pet while disarmed is EPERM, and disarming first writes and verifies 255,
+    so the fan cannot be left slow or stopped without a live loop (F9);
+  * control is proved (verified 255) before the watchdog is armed (F10), and
+    bus faults (tach 0, repeated read-back mismatch) go to full (F11).
+"""
+
+import argparse
+import configparser
+import ctypes
+import ctypes.util
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import syslog
+import threading
+import time
+
+DUTY_FULL = 0xFF
+STOPPED_COUNT = 0x1FFF
+SPINUP_TIMES_S = (0.25, 0.5, 1.0, 2.0)
+VERIFY_MARGIN_S = 0.5
+FULL_WRITE_TRIES = 3
+MISMATCH_LIMIT = 3                  # consecutive duty read-back mismatches
+PIDFILE = "/var/run/velo5x0_fand.pid"
+WATCHDOG_S = 30
+EMC_PRODUCT_ID = 0x1D
+TZ_ZEROC = 2731                 # sys/dev/acpica/acpivar.h, used by coretemp(4)
+
+STATE_DIR = "/var/run/velo5x0-fan"
+ALERT_FILE = STATE_DIR + "/ALERT"
+STATE_FILE = STATE_DIR + "/state.json"
+CONF_FILE = "/usr/local/etc/velo5x0-fan/fan.conf"
+
+EXIT_OK, EXIT_WRITE_FAILED, EXIT_PRECONDITION = 0, 1, 2
+EXIT_IDLE = 3                       # internal: do not exit, idle instead
+
+DEFAULTS = {
+    "off_c": 50.0, "on_c": 60.0, "full_c": 80.0,
+    "stall_free_duty": 24, "kick_duty": 255, "kick_s": 2.0,
+    "poll_s": 2.0, "stall_polls": 3, "stall_kicks": 3,
+    "drive_off_c": 55.0, "drive_on_c": 60.0, "drive_ramp_c": 65.0,
+    "drive_full_c": 70.0, "drive_min_duty": 69,
+    "drive_min_run_s": 600,         # 0 = off; max DRIVE_MIN_RUN_MAX_S
+    # on/off mode (edge520b): duty only 0 or 255
+    "mode": "auto",                 # auto: onoff on edge520b, curve otherwise
+    "onoff_min_run_s": 600,         # once ON, stay ON at least this long
+    "spinup_window_s": 5.0,         # after OFF->ON: measured first valid tach 0.3-0.7 s, ~baseline by 2.5-3 s
+    "restart_tolerance": 0.15,      # restart OK when count <= baseline * (1 + this)
+    "restart_tries": 3,             # failed restarts before alert + latch ON
+}
+STR_KEYS = ("mode",)
+INT_KEYS = ("stall_free_duty", "kick_duty", "stall_polls", "stall_kicks", "drive_min_duty",
+            "drive_min_run_s", "onoff_min_run_s", "restart_tries")
+DRIVE_MIN_RUN_MAX_S = 3600          # upper bound for drive_min_run_s
+
+SMARTCTL_INTERVAL_S = 60.0
+SMARTCTL_CMD_TIMEOUT_S = 3.0
+SMARTCTL_PASS_BUDGET_S = 8.0
+DRIVE_STALE_S = 180.0               # smartctl is read once a minute here
+
+
+class BusError(OSError):
+    pass
+
+
+# ------------------------------------------------------------------ sysctl
+class Sysctl:
+    """sysctlbyname(3) through ctypes: no fork per read."""
+
+    def __init__(self, libc=None):
+        if libc is None:
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        self.f = libc.sysctlbyname
+        self.f.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                           ctypes.c_void_p, ctypes.c_size_t]
+        self.f.restype = ctypes.c_int
+
+    def get_int(self, name):
+        v = ctypes.c_int(0)
+        n = ctypes.c_size_t(ctypes.sizeof(v))
+        if self.f(name.encode(), ctypes.byref(v), ctypes.byref(n), None, 0) != 0:
+            e = ctypes.get_errno()
+            raise BusError(e, "sysctl %s: %s" % (name, os.strerror(e)))
+        return v.value
+
+    def set_int(self, name, val):
+        v = ctypes.c_int(int(val))
+        if self.f(name.encode(), None, None, ctypes.byref(v), ctypes.sizeof(v)) != 0:
+            e = ctypes.get_errno()
+            raise BusError(e, "sysctl %s=%d: %s" % (name, val, os.strerror(e)))
+
+    def get_str(self, name):
+        n = ctypes.c_size_t(0)
+        if self.f(name.encode(), None, ctypes.byref(n), None, 0) != 0:
+            e = ctypes.get_errno()
+            raise BusError(e, "sysctl %s: %s" % (name, os.strerror(e)))
+        buf = ctypes.create_string_buffer(n.value + 1)
+        if self.f(name.encode(), buf, ctypes.byref(n), None, 0) != 0:
+            e = ctypes.get_errno()
+            raise BusError(e, "sysctl %s: %s" % (name, os.strerror(e)))
+        return buf.value.decode(errors="replace")
+
+
+class FanBus:
+    """The vc_fan kernel surface. Every write the daemon makes goes here."""
+
+    def __init__(self, sc):
+        self.sc = sc
+
+    def identified(self):
+        return self.sc.get_int("hw.vc_fan.identified") == 1 and \
+            self.sc.get_int("hw.vc_fan.chip_id") == EMC_PRODUCT_ID
+
+    def board(self):
+        try:
+            return self.sc.get_str("hw.vc_fan.board")
+        except OSError:
+            return "unknown"
+
+    def pins_failsafe(self):
+        """edge520b: bit 7 to input = fan full by hardware (no-op on 540)."""
+        self.sc.set_int("hw.vc_fan.pins_failsafe", 1)
+
+
+    def chip_id(self):
+        return self.sc.get_int("hw.vc_fan.chip_id")
+
+    def read_duty(self):
+        return self.sc.get_int("hw.vc_fan.duty")
+
+    def write_duty(self, d):
+        if not 0 <= int(d) <= 255:
+            raise ValueError("duty %r" % d)
+        self.sc.set_int("hw.vc_fan.duty", int(d))
+
+    def tach(self):
+        return self.sc.get_int("hw.vc_fan.tach")
+
+    def spinup_s(self):
+        try:
+            return SPINUP_TIMES_S[self.sc.get_int("hw.vc_fan.spinup_cfg") & 3]
+        except OSError:
+            return SPINUP_TIMES_S[-1]
+
+    def configure(self):
+        self.sc.set_int("hw.vc_fan.configure", 1)
+
+    def arm(self, s):
+        self.sc.set_int("hw.vc_fan.watchdog_s", int(s))
+
+    def pet(self):
+        self.sc.set_int("hw.vc_fan.pet", 1)
+
+    def dump(self):
+        return self.sc.get_str("hw.vc_fan.dump")
+
+
+def release_pins(bus, log, why):
+    """The second, hardware path to full. Never raises."""
+    try:
+        bus.pins_failsafe()
+        log("warning", "bit-7 fail-safe release requested (%s)" % why)
+        return True
+    except OSError as e:
+        log("crit", "ALERT: bit-7 fail-safe release failed (%s): %s" % (why, e))
+        return False
+
+
+def rpm_from_count(count):
+    """EMC2104 tach count to RPM (chip defaults)."""
+    if count >= STOPPED_COUNT or count <= 0:
+        return 0
+    return int(3932160 / count)
+
+
+# ------------------------------------------------------------- temperature
+def read_coretemp(sc):
+    """Hottest dev.cpu.N.temperature in C; None on ANY error (F1).
+    The sysctl is format IK: tenths of a kelvin, offset TZ_ZEROC (2731) as
+    coretemp(4) encodes it."""
+    try:
+        n = sc.get_int("hw.ncpu")
+        temps = [(sc.get_int("dev.cpu.%d.temperature" % i) - TZ_ZEROC) / 10.0 for i in range(n)]
+    except (OSError, ValueError):
+        return None
+    if not temps or any(t < -40 or t > 150 for t in temps):
+        return None                     # implausible = sensor fault
+    return max(temps)
+
+
+# ------------------------------------------------------------------ alerts
+def raise_alert(log, msg, alert_file):
+    log("crit", "ALERT: " + msg)
+    if alert_file:
+        try:
+            os.makedirs(os.path.dirname(alert_file), exist_ok=True)
+            with open(alert_file, "a") as f:
+                f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg))
+        except OSError:
+            pass
+
+
+def failsafe_full(bus, log, why, alert_file=ALERT_FILE, sleep=time.sleep,
+                  clock=time.monotonic, alert=True):
+    """Write 255; verify by read-back after the spin-up time; 3 tries.
+    255 is always accepted by the kernel (no watchdog needed)."""
+    spin = bus.spinup_s()
+    last, err = None, None
+    for attempt in range(1, FULL_WRITE_TRIES + 1):
+        try:
+            bus.write_duty(DUTY_FULL)
+            sleep(spin)
+            end = clock() + VERIFY_MARGIN_S
+            last = bus.read_duty()
+            while last != DUTY_FULL and clock() < end:
+                sleep(0.05)
+                last = bus.read_duty()
+            if last == DUTY_FULL:
+                log("warning", "fan set to full duty 0xff, verified (%s)" % why)
+                return True
+            log("err", "full duty written but duty reads 0x%02x (attempt %d)" % (last, attempt))
+        except OSError as e:
+            err = e
+            log("err", "full duty attempt %d failed: %s" % (attempt, e))
+    msg = "full duty NOT verified after %d attempts (%s); last %s%s" % (
+        FULL_WRITE_TRIES, why, "none" if last is None else "0x%02x" % last,
+        "" if err is None else "; error %s" % err)
+    if alert:
+        raise_alert(log, msg, alert_file)
+    else:
+        log("err", msg)
+    return False
+
+
+# ------------------------------------------------------------------ policy
+def target_duty(t, cfg):
+    sf, on_c, full_c = int(cfg["stall_free_duty"]), cfg["on_c"], cfg["full_c"]
+    if t >= full_c:
+        return DUTY_FULL
+    if t <= on_c:
+        return sf
+    d = sf + (DUTY_FULL - sf) * (t - on_c) / (full_c - on_c)
+    return max(sf, min(DUTY_FULL, int(round(d))))
+
+
+def drive_demand(t, on, cfg):
+    """Drive temperature bands with hysteresis: returns (duty, on)."""
+    if t is None or t <= cfg["drive_off_c"]:
+        return 0, False
+    if t >= cfg["drive_on_c"]:
+        on = True
+    if not on:
+        return 0, False
+    mn = int(cfg["drive_min_duty"])
+    if t >= cfg["drive_full_c"]:
+        return DUTY_FULL, True
+    if t <= cfg["drive_ramp_c"]:
+        return mn, True
+    d = mn + (DUTY_FULL - mn) * (t - cfg["drive_ramp_c"]) / (cfg["drive_full_c"] - cfg["drive_ramp_c"])
+    return max(mn, min(DUTY_FULL, int(d + 0.5))), True
+
+
+# ------------------------------------------------------------ drive source
+def _run(args, timeout):
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        try:
+            p.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise
+    return out
+
+
+class SmartSource:
+    """FreeBSD has no drivetemp: smartctl (os-smart / smartmontools) if it is
+    installed, else no drive input. Discovered afresh on each pass (14E)."""
+
+    def __init__(self, which=shutil.which, run=_run, clock=time.monotonic):
+        self.which, self.run, self.clock = which, run, clock
+
+    def poll(self):
+        exe = self.which("smartctl")
+        if not exe:
+            return {}
+        start, res = self.clock(), {}
+        try:
+            devs = json.loads(self.run([exe, "--scan", "-j"], SMARTCTL_CMD_TIMEOUT_S)).get("devices", [])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return res
+        for dev in devs:
+            if self.clock() - start > SMARTCTL_PASS_BUDGET_S:
+                break
+            path = dev.get("name", "")
+            if not path.startswith("/dev/"):
+                continue
+            args = [exe, "-A", "-j", "-n", "standby"]
+            if dev.get("type"):
+                args += ["-d", dev["type"]]
+            try:
+                j = json.loads(self.run(args + [path], SMARTCTL_CMD_TIMEOUT_S))
+            except subprocess.TimeoutExpired:
+                res[os.path.basename(path)] = None
+                continue
+            except (OSError, ValueError, subprocess.SubprocessError):
+                continue
+            cur = (j.get("temperature") or {}).get("current")
+            if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                res[os.path.basename(path)] = float(cur)
+        return res
+
+
+class DriveReader:
+    """Reads drives on a daemon thread so a hung drive never delays the loop
+    (14A). poll() -> {name: C|None} without I/O. A hung read holds the last
+    readings (x-amendment-hung-read) for drives whose /dev node still exists."""
+
+    def __init__(self, source, interval_s=SMARTCTL_INTERVAL_S, stale_s=DRIVE_STALE_S,
+                 clock=time.monotonic, exists=os.path.exists):
+        self.source, self.interval_s, self.stale_s = source, interval_s, stale_s
+        self.clock, self.exists = clock, exists
+        self._lock = threading.Lock()
+        self._snap = None
+        self._stop = threading.Event()
+
+    def refresh(self):
+        try:
+            r = self.source.poll()
+        except Exception:
+            r = {}
+        with self._lock:
+            self._snap = (dict(r), self.clock())
+
+    def start(self):
+        def loop():
+            while not self._stop.is_set():
+                self.refresh()
+                self._stop.wait(self.interval_s)
+        threading.Thread(target=loop, name="velo5x0-drives", daemon=True).start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def poll(self):
+        with self._lock:
+            snap = self._snap
+        if snap is None:
+            return {}
+        if self.clock() - snap[1] <= self.stale_s:
+            return dict(snap[0])
+        return {n: v for n, v in snap[0].items() if self.exists("/dev/" + n)}
+
+
+# -------------------------------------------------------------- controller
+class Controller:
+    OFF, RUN, ON = "off", "run", "on"
+
+    def __init__(self, bus, temp_fn, cfg, log, sleep=time.sleep, clock=time.monotonic,
+                 drive_fn=None, state_file=None, alert_file=None):
+        self.bus, self.temp_fn, self.cfg, self.log = bus, temp_fn, cfg, log
+        self.sleep, self.clock = sleep, clock
+        self.drive_fn = drive_fn
+        self.state_file, self.alert_file = state_file, alert_file
+        self.drive_hold_until = None        # min-run hold
+        self.state = None
+        self.duty = None
+        self.drive_on = False
+        self.drive_temp = None
+        self.drive_duty = 0
+        self.sensor_error = False
+        self.full_failed = False
+        self.stall_latched = False
+        self.stopped_polls = 0
+        self.kicks = 0
+        self.max_temp = None
+        self.mismatches = 0                 # consecutive read-back mismatches
+        self.written_at = None              # last duty write (spin-up settle)
+        self.spin_s = SPINUP_TIMES_S[-1]
+        self.bus_fault = False
+        validate(cfg, log)
+        self.board = bus.board()
+        mode = cfg.get("mode", "auto")
+        if mode == "auto":
+            mode = "onoff" if self.board == "edge520b" else "curve"
+        self.mode = mode
+        self.baseline = None                # full-duty tach count measured at start (onoff)
+        self.on_since = None
+        self.off_enabled = False            # onoff: OFF allowed only after a valid baseline
+        self.restart_failures = 0
+        self.last_restart_s = None
+
+    def full(self, why):
+        ok = failsafe_full(self.bus, self.log, why, self.alert_file, self.sleep, self.clock,
+                           alert=not self.full_failed)
+        self.duty = DUTY_FULL if ok else None
+        self.full_failed = not ok
+        if not ok:
+            release_pins(self.bus, self.log, "full not verified: " + why)
+        return ok
+
+    def set_duty(self, d):
+        if d != 0 and d != DUTY_FULL and d < int(self.cfg["stall_free_duty"]):
+            raise AssertionError("duty %d below stall-free duty" % d)
+        self.bus.write_duty(d)          # also pets the kernel watchdog
+        self.duty = d
+        self.written_at = self.clock()
+
+    def start(self):
+        # never guess the board; on edge520b the curve mode would stop
+        # the fan at every duty below 255
+        if self.board not in ("edge520b", "edge540b"):
+            raise RuntimeError("board unknown (hw.vc_fan.board read failed: %r)" % self.board)
+        if self.board == "edge520b" and self.mode != "onoff":
+            raise RuntimeError("mode %r refused on edge520b (on/off only)" % self.mode)
+        self.duty = self.bus.read_duty()
+        self.log("info", "duty read at start: 0x%02x (board %s, mode %s)"
+                 % (self.duty, self.board, self.mode))
+        self.spin_s = self.bus.spinup_s()
+        # prove control (verified 255) BEFORE configure drives bit 7
+        # on edge520b, and before arming, so a process that dies hard on every
+        # restart leaves the fan at full, not at its last duty
+        if not self.full("service start"):
+            raise RuntimeError("full duty not verified at start")
+        self.bus.configure()
+        if self.bus.read_duty() != DUTY_FULL:
+            raise RuntimeError("duty not 0xff after configure")
+        self.bus.arm(WATCHDOG_S)        # before any write below 255 (F9)
+        if self.mode == "onoff":
+            self.start_onoff()
+
+    # -- on/off mode (edge520b) -------------------------------------------
+    def tach_valid(self, count):
+        return 0 < count < STOPPED_COUNT
+
+    def start_onoff(self):
+        """Measure the full-duty baseline (the fan was just set to full). OFF
+        is enabled only with a valid baseline; the service starts ON, so the
+        first OFF comes after the minimum run and every later ON transition
+        re-proves the restart."""
+        self.sleep(float(self.cfg["spinup_window_s"]))
+        counts = []
+        for _ in range(3):
+            self.bus.pet()
+            counts.append(self.bus.tach())
+            self.sleep(0.5)
+        if all(self.tach_valid(x) for x in counts):
+            self.baseline = sorted(counts)[1]
+            self.off_enabled = True
+            self.log("info", "on/off mode: full-duty baseline tach count %d (~%d rpm formula); "
+                     "OFF enabled" % (self.baseline, rpm_from_count(self.baseline)))
+        else:
+            raise_alert(self.log, "on/off mode: no valid tach at full duty (%s); fan latched ON"
+                        % counts, self.alert_file)
+            self.stall_latched = True
+            release_pins(self.bus, self.log, "no baseline")
+        self.state = self.ON
+        self.on_since = self.clock()
+
+    def restart_ok(self):
+        """OFF -> ON: write 255 and wait up to spinup_window_s for a tach count
+        near the baseline. Returns the seconds it took, or None."""
+        limit = self.baseline * (1.0 + float(self.cfg["restart_tolerance"]))
+        t0 = self.clock()
+        self.set_duty(DUTY_FULL)
+        while True:
+            self.sleep(0.25)
+            self.bus.pet()
+            count = self.bus.tach()
+            if self.tach_valid(count) and count <= limit:
+                return self.clock() - t0
+            if self.clock() - t0 >= float(self.cfg["spinup_window_s"]):
+                return None
+
+    def turn_on(self, why):
+        tries = int(self.cfg["restart_tries"])
+        for n in range(1, tries + 1):
+            dt = self.restart_ok()
+            if dt is not None:
+                self.last_restart_s = dt
+                self.restart_failures = 0
+                self.log("info", "fan ON (%s): restart verified in %.2f s" % (why, dt))
+                break
+            self.restart_failures += 1
+            raise_alert(self.log, "fan did not restart within %.1f s (try %d/%d)"
+                        % (float(self.cfg["spinup_window_s"]), n, tries), self.alert_file)
+            if n < tries:
+                self.set_duty(0)            # re-trigger: off, then on again
+                self.sleep(1.0)
+        else:
+            raise_alert(self.log, "fan restart failed %d times: latched ON (full) until restart"
+                        % tries, self.alert_file)
+            self.stall_latched = True
+            self.full("restart failure")
+            release_pins(self.bus, self.log, "restart failure latch")
+        self.state = self.ON
+        self.on_since = self.clock()
+
+    def turn_off(self):
+        self.set_duty(0)                    # kernel refuses this unless the watchdog is armed
+        self.state = self.OFF
+        self.log("info", "fan OFF after %.0f s ON" % (self.clock() - self.on_since))
+
+    def step_onoff(self, t, dd):
+        c = self.cfg
+        hot = t >= c["on_c"] or dd > 0
+        cool = t <= c["off_c"] and dd == 0
+        if self.state == self.OFF:
+            if hot:
+                self.turn_on("%.1f C%s" % (t, ", drive demand" if dd > 0 else ""))
+                return
+            # intended OFF: the tach is not judged (it reads stopped); duty must read 0
+            actual = self.bus.read_duty()
+            if actual != 0:
+                self.mismatches += 1
+                if self.mismatches >= MISMATCH_LIMIT:
+                    self.fault("duty read back 0x%02x while OFF, %d polls" % (actual, self.mismatches))
+                    return
+                self.set_duty(0)
+            else:
+                self.mismatches = 0
+                self.bus.pet()
+            if self.bus.tach() == 0:        # a real tach never reads 0
+                self.fault("tach count reads 0 (I2C bus fault?)")
+            return
+        # ON
+        if (cool and self.off_enabled and not self.stall_latched and
+                self.clock() - self.on_since >= float(c["onoff_min_run_s"])):
+            self.turn_off()
+            return
+        actual = self.bus.read_duty()
+        if actual != DUTY_FULL:
+            self.log("warning", "duty reads 0x%02x while ON: rewriting 0xff" % actual)
+            self.set_duty(DUTY_FULL)
+        else:
+            self.bus.pet()
+        # stall at ON: judged only here, after the restart was verified
+        count = self.bus.tach()
+        if count == 0:
+            self.fault("tach count reads 0 (I2C bus fault?)")
+            return
+        slow = self.baseline is not None and count > self.baseline * 2
+        if not self.tach_valid(count) or slow:
+            self.stopped_polls += 1
+            if self.stopped_polls >= int(c["stall_polls"]):
+                raise_alert(self.log, "fan stalled or slow while ON (count %d, baseline %s): "
+                            "latched ON" % (count, self.baseline), self.alert_file)
+                self.stall_latched = True
+                self.stopped_polls = 0
+                release_pins(self.bus, self.log, "stall latch")
+        else:
+            self.stopped_polls = 0
+
+    def kick(self):
+        self.bus.write_duty(int(self.cfg["kick_duty"]))
+        self.sleep(float(self.cfg["kick_s"]))
+        self.stopped_polls = 0          # reset on a duty change
+
+    def drive_step(self):
+        if self.drive_fn is None:
+            return 0
+        try:
+            d = self.drive_fn()
+        except Exception as e:
+            self.log("warning", "drive source failed: %r" % (e,))
+            d = {}
+        live = {n: v for n, v in d.items() if v is not None}
+        self.drive_temp = max(live.values()) if live else None
+        was_on = self.drive_on
+        dd, self.drive_on = drive_demand(self.drive_temp, self.drive_on, self.cfg)
+        # Minimum run, each
+        # rising edge of drive-demand-on starts a hold of drive_min_run_s;
+        # while it runs, a release of drive demand is held at drive_min_duty.
+        # A vanished drive (no reading) or drive_min_run_s = 0 clears it. The
+        # hold never raises the duty above drive demand, and the CPU
+        # fail-safes and the stall latch do not read it. Not kept over restart.
+        run_s = int(self.cfg["drive_min_run_s"])
+        now = self.clock()
+        if self.drive_on and not was_on and run_s > 0:
+            self.drive_hold_until = now + run_s
+            self.log("info", "drive demand on: minimum run holds duty %d for %d s"
+                     % (int(self.cfg["drive_min_duty"]), run_s))
+        elif self.drive_hold_until is not None:
+            if self.drive_temp is None or run_s <= 0:
+                self.drive_hold_until = None
+                self.log("info", "minimum run ended: no drive reports a temperature")
+            elif now >= self.drive_hold_until:
+                self.drive_hold_until = None
+                self.log("info", "minimum run ended: drive demand follows the drive again")
+            elif not self.drive_on and was_on:
+                dd, self.drive_on = int(self.cfg["drive_min_duty"]), True
+        self.drive_duty = dd
+        return dd
+
+    def fault(self, msg):
+        """A bus that answers with nonsense. Full duty, alert once, latch."""
+        if not self.bus_fault:
+            raise_alert(self.log, msg + "; full duty latched until restart", self.alert_file)
+        self.bus_fault = True
+        self.stall_latched = True
+        self.full("bus fault")
+        release_pins(self.bus, self.log, "bus fault latch")
+
+    def check_stall(self, want):
+        count = self.bus.tach()
+        if count == 0:                  # a real tach never reads 0
+            self.fault("tach count reads 0 (I2C bus fault?)")
+            return
+        stopped = count >= STOPPED_COUNT
+        if not stopped:
+            self.stopped_polls = self.kicks = 0
+            return
+        self.stopped_polls += 1
+        if self.stopped_polls < int(self.cfg["stall_polls"]):
+            return
+        self.stopped_polls = 0
+        if self.kicks >= int(self.cfg["stall_kicks"]):
+            raise_alert(self.log, "fan stalled after %d kicks at duty %d; latching full duty "
+                        "until restart" % (self.kicks, self.duty), self.alert_file)
+            self.stall_latched = True
+            self.full("fan stalled")
+            return
+        self.log("warning", "fan stalled at duty %d: kick" % self.duty)
+        self.kick()
+        self.set_duty(want)
+        self.kicks += 1
+
+    def step(self):
+        t = self.temp_fn()
+        if t is None:                                   # F1
+            if not self.sensor_error:
+                raise_alert(self.log, "CPU temperature read failed; fan at full", self.alert_file)
+            self.sensor_error = True
+            was_off = (self.duty == 0)
+            if self.duty != DUTY_FULL or self.bus.read_duty() != DUTY_FULL:
+                self.full("sensor read error")
+            else:
+                self.bus.pet()
+            if self.mode == "onoff":
+                self.state, self.on_since = self.ON, self.clock()
+                if was_off and self.baseline is not None:
+                    self.sleep(float(self.cfg["spinup_window_s"]))
+                    if not self.tach_valid(self.bus.tach()):
+                        raise_alert(self.log, "fan did not restart after a sensor error: "
+                                    "latched ON", self.alert_file)
+                        self.stall_latched = True
+                        release_pins(self.bus, self.log, "sensor-error restart latch")
+            else:
+                self.state = self.RUN
+            self.write_state(None)
+            return t
+        if self.sensor_error:
+            self.log("info", "CPU temperature readable again (%.1f C)" % t)
+            self.sensor_error = False
+        self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
+        if self.stall_latched:
+            if self.duty != DUTY_FULL or self.bus.read_duty() != DUTY_FULL:
+                self.full("stall latch")
+            else:
+                self.bus.pet()
+            self.write_state(t)
+            return t
+        c = self.cfg
+        dd = self.drive_step()
+        if self.mode == "onoff":
+            self.step_onoff(t, dd)
+            self.write_state(t)
+            return t
+        cpu_kick = False
+        if self.state is None:
+            self.state = self.OFF if t <= c["off_c"] else self.RUN
+        elif self.state == self.OFF and t >= c["on_c"]:
+            self.state, cpu_kick = self.RUN, True
+            self.log("info", "%.1f C >= %.0f C: fan on" % (t, c["on_c"]))
+        elif self.state == self.RUN and t <= c["off_c"]:
+            self.state = self.OFF
+            self.log("info", "%.1f C <= %.0f C: CPU demand off" % (t, c["off_c"]))
+        cpu_d = 0 if self.state == self.OFF else target_duty(t, c)
+        want = max(cpu_d, dd)
+        if want > 0 and (cpu_kick or self.duty == 0):
+            self.kick()
+            self.set_duty(want)
+        elif want != self.duty:
+            self.set_duty(want)
+        else:
+            # re-assert if the register disagrees (chip reset, a hand write)
+            actual = self.bus.read_duty()
+            settling = (self.written_at is not None and
+                        self.clock() - self.written_at < self.spin_s + VERIFY_MARGIN_S)
+            if actual == self.duty or settling:
+                self.mismatches = 0 if actual == self.duty else self.mismatches
+                self.bus.pet()
+            else:
+                self.mismatches += 1
+                if self.mismatches >= MISMATCH_LIMIT:
+                    self.fault("duty read back 0x%02x, expected 0x%02x, %d polls running"
+                               % (actual, self.duty, self.mismatches))
+                    self.write_state(t)
+                    return t
+                self.log("warning", "duty reads 0x%02x, expected 0x%02x: rewriting" % (actual, self.duty))
+                self.set_duty(want)     # the write also pets the watchdog
+        if want > 0 and not cpu_kick:
+            self.check_stall(want)
+        self.write_state(t)
+        return t
+
+    def write_state(self, t):
+        if not self.state_file:
+            return
+        try:
+            count = self.bus.tach()
+        except OSError:
+            count = None
+        st = {"time": time.time(), "temp_c": t, "max_temp_c": self.max_temp, "state": self.state,
+              "duty": self.duty, "rpm_approx": None if count is None else rpm_from_count(count),
+              "tach_stopped": None if count is None else count >= STOPPED_COUNT,
+              "sensor_error": self.sensor_error, "stall_latched": self.stall_latched,
+              "full_failed": self.full_failed, "drive_temp_c": self.drive_temp,
+              "drive_demand_on": self.drive_on, "drive_duty": self.drive_duty,
+              "mode": self.mode, "baseline_count": self.baseline, "off_enabled": self.off_enabled,
+              "on_since_age_s": None if self.on_since is None else round(self.clock() - self.on_since),
+              "last_restart_s": self.last_restart_s, "restart_failures": self.restart_failures}
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+
+def validate(c, log=None):
+    if not (c["off_c"] < c["on_c"] < c["full_c"]):
+        raise ValueError("need off_c < on_c < full_c")
+    if not (1 <= int(c["stall_free_duty"]) <= DUTY_FULL):
+        raise ValueError("stall_free_duty must be 1..255")
+    if not (c["drive_off_c"] < c["drive_on_c"] <= c["drive_ramp_c"] < c["drive_full_c"]):
+        raise ValueError("need drive_off_c < drive_on_c <= drive_ramp_c < drive_full_c")
+    if not (int(c["stall_free_duty"]) < int(c["drive_min_duty"]) <= DUTY_FULL):
+        # move the drive minimum just above stall-free
+        fixed = min(DUTY_FULL, int(c["stall_free_duty"]) + 1)
+        if log:
+            log("warning", "drive_min_duty %d is not above stall_free_duty %d: using %d"
+                % (int(c["drive_min_duty"]), int(c["stall_free_duty"]), fixed))
+        c["drive_min_duty"] = fixed
+    if not 0 <= float(c["drive_min_run_s"]) <= DRIVE_MIN_RUN_MAX_S:
+        raise ValueError("drive_min_run_s must be 0 to %d seconds (0 disables the minimum run)"
+                         % DRIVE_MIN_RUN_MAX_S)
+    if float(c["poll_s"]) * 3 > WATCHDOG_S:
+        raise ValueError("poll_s too long for the %d s kernel watchdog" % WATCHDOG_S)
+    if c.get("mode", "auto") not in ("auto", "curve", "onoff"):
+        raise ValueError("mode must be auto, curve or onoff")
+    if not 0 <= float(c["onoff_min_run_s"]) <= 3600:
+        raise ValueError("onoff_min_run_s must be 0..3600")
+    if not 1.0 <= float(c["spinup_window_s"]) <= 10.0:
+        raise ValueError("spinup_window_s must be 1..10 s")
+    if not 0.02 <= float(c["restart_tolerance"]) <= 0.5:
+        raise ValueError("restart_tolerance must be 0.02..0.5")
+    if not 1 <= int(c["restart_tries"]) <= 5:
+        raise ValueError("restart_tries must be 1..5")
+    if int(c["restart_tries"]) * (float(c["spinup_window_s"]) + 1.0) > WATCHDOG_S - 5:
+        raise ValueError("restart_tries x (spinup_window_s + 1) must fit the %d s watchdog" % WATCHDOG_S)
+    if (float(c["kick_s"]) + float(c["poll_s"])) * 2 > WATCHDOG_S:
+        raise ValueError("kick_s too long for the %d s kernel watchdog" % WATCHDOG_S)
+
+
+def load_config(path=CONF_FILE):
+    cfg = dict(DEFAULTS)
+    cp = configparser.ConfigParser()
+    if os.path.exists(path):
+        cp.read(path)
+        if cp.has_section("fan"):
+            for k in DEFAULTS:
+                if cp.has_option("fan", k):
+                    cfg[k] = cp.get("fan", k).strip() if k in STR_KEYS else float(cp.get("fan", k))
+    for k in INT_KEYS:
+        cfg[k] = int(cfg[k])
+    return cfg
+
+
+# ---------------------------------------------------------------- helpers
+def make_logger(stderr=False):
+    pri = {"crit": syslog.LOG_CRIT, "err": syslog.LOG_ERR, "warning": syslog.LOG_WARNING,
+           "info": syslog.LOG_INFO}
+    syslog.openlog("velo5x0-fan", 0, syslog.LOG_DAEMON)
+
+    def log(level, msg):
+        syslog.syslog(pri[level], msg)
+        if stderr:
+            print("%s: %s" % (level, msg), file=sys.stderr, flush=True)
+    return log
+
+
+def open_bus(log, sc=None):
+    try:
+        bus = FanBus(sc or Sysctl())
+        if bus.identified():
+            return bus
+        log("err", "vc_fan: chip at 0x2f has ID %d, not an EMC2104 (or no answer); writing nothing"
+            % bus.chip_id())
+    except OSError as e:
+        log("err", "vc_fan kernel module not loaded or not answering (%s); writing nothing" % e)
+    return None
+
+
+def service_running(pidfile=PIDFILE):
+    """True if the daemon(8) supervisor of velo5x0_fand is alive."""
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_full(args, log):
+    """Write and verify 255. Never disarms the watchdog: a running loop
+    keeps its watchdog, and a stale one fires harmlessly at full duty."""
+    bus = open_bus(log)
+    if bus is None:
+        return EXIT_PRECONDITION
+    ok = failsafe_full(bus, log, args.why)
+    release_pins(bus, log, args.why)    # edge520b: the hardware path too; no-op on 540
+    return EXIT_OK if ok else EXIT_WRITE_FAILED
+
+
+class StartFailure(Exception):
+    pass
+
+
+def run_loop(bus, cfg, log, temp_fn, drive_fn, stop, sleep=time.sleep, clock=time.monotonic,
+             state_file=None, alert_file=None):
+    """Returns the exit code, or EXIT_IDLE when the daemon must not be
+    restarted (control could not be established at start). Separated from
+    cmd_run for the unit tests."""
+    c = None
+    started = False
+    try:
+        c = Controller(bus, temp_fn, cfg, log, sleep=sleep, clock=clock, drive_fn=drive_fn,
+                       state_file=state_file, alert_file=alert_file)
+        try:
+            c.start()
+        except Exception as e:
+            raise StartFailure(e)
+        started = True
+        while not stop["flag"]:
+            c.step()
+            sleep(float(cfg["poll_s"]))
+    except StartFailure as e:
+        raise_alert(log, "could not establish control at start: %r; fan left at full" % (e.args[0],),
+                    alert_file)
+        failsafe_full(bus, log, "start failure", alert_file, sleep, clock, alert=False)
+        release_pins(bus, log, "start failure")
+        return EXIT_IDLE
+    except Exception as e:                              # F2
+        log("err", "control failure: %r" % (e,))
+        if not failsafe_full(bus, log, "control failure", alert_file, sleep, clock):
+            release_pins(bus, log, "control failure, full not verified")
+        return EXIT_WRITE_FAILED                       # daemon(8) -r restarts and re-arms
+    ok = failsafe_full(bus, log, "service stop", alert_file, sleep, clock)   # F3
+    release_pins(bus, log, "service stop")     # edge520b: fan full by hardware too
+    if ok and started:
+        try:
+            bus.arm(0)          # the kernel itself writes and verifies 255 before disarming
+        except OSError as e:
+            log("err", "watchdog disarm refused (%s); it stays armed" % e)
+    return EXIT_OK if ok else EXIT_WRITE_FAILED
+
+
+def idle_until_term(log, why, stop=None, sleep=time.sleep):
+    """daemon(8) -r restarts on ANY exit, so a condition that a restart
+    cannot fix (no EMC2104, bad configuration, no control at start) is logged
+    once and the process then waits for SIGTERM, writing nothing. rc.d prestart
+    refuses to start the service when the chip is not identified, so this is
+    the runtime path only."""
+    log("warning", "%s; idle until stopped (no restart loop)" % why)
+    if stop is None:
+        stop = {"flag": False}
+
+    def on_term(signum, frame):
+        stop["flag"] = True
+    try:
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+    except ValueError:
+        pass                    # not the main thread (tests)
+    while not stop["flag"]:
+        sleep(60)
+    return EXIT_OK
+
+
+def cmd_run(args, log):
+    bus = None
+    for n in range(5):                  # ~10 s for the module at boot
+        bus = open_bus(log)
+        if bus is not None:
+            break
+        time.sleep(2)
+    if bus is None:
+        return idle_until_term(log, "no identified EMC2104 through vc_fan")
+    stop = {"flag": False}
+
+    def on_term(signum, frame):
+        stop["flag"] = True
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    try:
+        cfg = load_config(getattr(args, "conf", None) or CONF_FILE)
+        validate(cfg, log)
+    except (ValueError, configparser.Error) as e:
+        raise_alert(log, "bad configuration: %s" % e, ALERT_FILE)
+        failsafe_full(bus, log, "bad configuration")
+        return idle_until_term(log, "bad configuration, fan at full", stop)
+    sc = bus.sc
+    reader = DriveReader(SmartSource()).start()
+    log("info", "start: off %.0f on %.0f full %.0f C, stall-free %d; drives %.0f/%.0f/%.0f/%.0f C "
+        "min %d, min run %.0f s" % (cfg["off_c"], cfg["on_c"], cfg["full_c"], cfg["stall_free_duty"],
+                                    cfg["drive_off_c"], cfg["drive_on_c"], cfg["drive_ramp_c"],
+                                    cfg["drive_full_c"], cfg["drive_min_duty"], cfg["drive_min_run_s"]))
+    rc = run_loop(bus, cfg, log, lambda: read_coretemp(sc), reader.poll, stop,
+                  state_file=STATE_FILE, alert_file=ALERT_FILE)
+    if rc == EXIT_IDLE:
+        return idle_until_term(log, "no control at start, fan at full", stop)
+    return rc
+
+
+def cmd_probe(args, log):
+    sc = Sysctl()
+    out = {"coretemp_c": read_coretemp(sc)}
+    for k in ("identified", "chip_id", "duty", "tach", "spinup_cfg", "watchdog_s", "wd_fired",
+              "wd_failing", "wd_retries", "bus_stuck", "pins_enable"):
+        try:
+            out[k] = sc.get_int("hw.vc_fan." + k)
+        except OSError as e:
+            out[k] = "error %s" % e.errno
+    try:
+        out["dump"] = sc.get_str("hw.vc_fan.dump")
+    except OSError as e:
+        out["dump"] = "error %s" % e.errno
+    if isinstance(out.get("tach"), int):
+        out["rpm_approx"] = rpm_from_count(out["tach"])
+    print(json.dumps(out, indent=1))
+    return EXIT_OK
+
+
+def cmd_set(args, log, running=service_running, sleep=time.sleep, clock=time.monotonic, sc=None):
+    """Supervised manual duty (control test). Refused while the service runs
+    (race) unless --force. Always ends at verified full; never disarms (the
+    watchdog then fires at full duty within 30 s, which is harmless)."""
+    if running() and not getattr(args, "force", False):
+        log("err", "velo5x0_fand is running; stop it first (or --force)")
+        return EXIT_PRECONDITION
+    bus = open_bus(log, sc)
+    if bus is None:
+        return EXIT_PRECONDITION
+    sc = bus.sc
+    ok = False
+    try:
+        if not 0 <= args.duty <= 255:
+            raise ValueError("duty must be 0..255")
+        bus.configure()
+        bus.arm(WATCHDOG_S)
+        bus.write_duty(args.duty)
+        end = clock() + args.hold
+        while clock() < end:
+            sleep(2)
+            bus.pet()
+            cnt = bus.tach()
+            t = read_coretemp(sc)
+            print(json.dumps({"t": round(time.time()), "duty": bus.read_duty(), "tach": cnt,
+                              "rpm_approx": rpm_from_count(cnt), "cpu_c": t}), flush=True)
+            if t is None or t >= 70:
+                log("warning", "set: CPU %s, ending early" % t)
+                break
+    finally:
+        ok = failsafe_full(bus, log, "set end", sleep=sleep, clock=clock)
+    return EXIT_OK if ok else EXIT_WRITE_FAILED
+
+
+def cmd_load(args, log, run=subprocess.run, sc=None):
+    """The only sanctioned hand load. vc_pcu_gpio AND vc_board must already
+    be loaded (by 05-velo-switch); vc_fan never loads either of them."""
+    for m in ("vc_pcu_gpio", "vc_board"):
+        if run(["kldstat", "-q", "-m", m]).returncode != 0:
+            log("err", "%s is not loaded; refusing to load vc_fan (it must never pull in the "
+                "board modules)" % m)
+            return EXIT_PRECONDITION
+    if run(["kldstat", "-q", "-m", "vc_fan"]).returncode == 0:
+        log("info", "vc_fan already loaded")
+        return EXIT_OK
+    r = run(["kldload", args.path])
+    if r.returncode != 0:
+        log("err", "kldload %s failed (%d)" % (args.path, r.returncode))
+        return EXIT_WRITE_FAILED
+    return EXIT_OK
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="velo5x0-fan")
+    ap.add_argument("--stderr", action="store_true", help="also log to stderr (supervised runs)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--conf", default=None, help="configuration file (default %s)" % CONF_FILE)
+    f = sub.add_parser("full")
+    f.add_argument("--why", default="fail-safe")
+    sub.add_parser("probe")
+    s = sub.add_parser("set")
+    s.add_argument("duty", type=int)
+    s.add_argument("--hold", type=float, default=60.0)
+    s.add_argument("--force", action="store_true", help="even while velo5x0_fand runs")
+    ld = sub.add_parser("load")
+    ld.add_argument("path", nargs="?", default="/boot/modules/vc_fan.ko")
+    args = ap.parse_args(argv)
+    log = make_logger(stderr=args.stderr or sys.stderr.isatty())
+    return {"run": cmd_run, "full": cmd_full, "probe": cmd_probe, "set": cmd_set,
+            "load": cmd_load}[args.cmd](args, log)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
